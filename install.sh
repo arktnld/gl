@@ -55,7 +55,6 @@ fi
 # 2. Verificar Dependências
 log_step "Verificando dependências..."
 MISSING_DEPS=()
-INSTALL_CMD=""
 
 for cmd in git curl jq openssl; do
     if command -v "$cmd" &>/dev/null; then
@@ -68,6 +67,8 @@ done
 
 if [[ ${#MISSING_DEPS[@]} -gt 0 ]]; then
     echo ""
+    INSTALL_CMD=""
+
     if [[ "$OS" == "linux" ]]; then
         if command -v apt &>/dev/null; then
             INSTALL_CMD="sudo apt update && sudo apt install -y ${MISSING_DEPS[*]}"
@@ -195,12 +196,11 @@ echo ""
 read -sp "Token (cole aqui): " GITLAB_TOKEN
 echo ""
 
+SKIP_TOKEN=false
 if [[ -z "$GITLAB_TOKEN" ]]; then
     echo ""
     log_warn "Token não fornecido. Execute depois: gl --setup"
     SKIP_TOKEN=true
-else
-    SKIP_TOKEN=false
 fi
 
 # 9.3 Git User
@@ -257,13 +257,13 @@ if [[ -n "$GIT_EMAIL" ]]; then
     log_info "Git user.email: $GIT_EMAIL"
 fi
 
-# 13. Configurar credential helper (NÃO VAI MAIS PEDIR TOKEN!)
+# 13. Configurar credential helper
 git config --global credential.helper store
 log_info "Credential helper configurado (token salvo automaticamente)"
 
 # 14. Salvar Token
 if [[ "$SKIP_TOKEN" == "false" ]]; then
-    # Usar mesma lógica do script gl
+    # Salvar token para API do gl
     if command -v secret-tool &>/dev/null; then
         echo -n "$GITLAB_TOKEN" | secret-tool store --label="GitLab Token (gl)" application gl service gitlab 2>/dev/null
         log_info "Token armazenado no GNOME Keyring"
@@ -280,16 +280,16 @@ if [[ "$SKIP_TOKEN" == "false" ]]; then
     # Salvar token também em ~/.git-credentials para git push
     CRED_FILE="$HOME/.git-credentials"
 
-    # Verificar se já existe entrada para esse host
-    if [[ -f "$CRED_FILE" ]] && grep -q "://${GITLAB_HOST}" "$CRED_FILE"; then
-        # Remover entrada antiga
-        sed -i "/${GITLAB_HOST}/d" "$CRED_FILE"
+    # Remover entrada antiga do host se existir
+    if [[ -f "$CRED_FILE" ]]; then
+        grep -v "${GITLAB_HOST}" "$CRED_FILE" > "${CRED_FILE}.tmp" 2>/dev/null || true
+        mv "${CRED_FILE}.tmp" "$CRED_FILE" 2>/dev/null || true
     fi
 
     # Adicionar nova entrada
     echo "https://oauth2:${GITLAB_TOKEN}@${GITLAB_HOST}" >> "$CRED_FILE"
     chmod 600 "$CRED_FILE"
-    log_info "Token salvo em ~/.git-credentials (não vai pedir senha em git push)"
+    log_info "Token salvo em ~/.git-credentials (git push não pedirá senha)"
 
     # 15. Testar conexão com GitLab
     echo ""
@@ -303,13 +303,12 @@ if [[ "$SKIP_TOKEN" == "false" ]]; then
     BODY=$(echo "$TEST_RESULT" | sed '$d')
 
     if [[ "$HTTP_CODE" == "200" ]]; then
-        USERNAME=$(echo "$BODY" | jq -r '.username // "unknown"' 2>/dev/null)
+        USERNAME=$(echo "$BODY" | jq -r '.username // "unknown"' 2>/dev/null || echo "unknown")
         log_info "${C_GREEN}Conectado como: ${C_BOLD}$USERNAME${C_RESET}"
     else
-        log_error "Falha na autenticação (HTTP $HTTP_CODE)"
-        echo "Resposta: $BODY"
         echo ""
-        log_warn "Execute 'gl --set-token' para reconfigurar"
+        log_warn "Falha na autenticação (HTTP $HTTP_CODE)"
+        echo "Execute 'gl --set-token' para reconfigurar"
     fi
 fi
 
