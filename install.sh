@@ -6,7 +6,7 @@
 
 set -euo pipefail
 
-readonly REPO_URL="https://raw.githubusercontent.com/seu-repo/gl/main/gl"
+readonly REPO_URL="https://raw.githubusercontent.com/arktnld/gl/master/gl"
 readonly SCRIPT_NAME="gl"
 readonly VERSION="4.0"
 
