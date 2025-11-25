@@ -172,7 +172,7 @@ else
     log_warn "Reinicie seu terminal ou execute: source $SHELL_RC"
 fi
 
-# 9. Setup Inicial COMPLETO (novo!)
+# 9. Setup Inicial COMPLETO
 echo ""
 echo -e "${C_GREEN}${C_BOLD}✅ Instalação concluída!${C_RESET}\n"
 
@@ -182,7 +182,7 @@ log_step "Configuração Inicial"
 read -p "GitLab Host [git.agdtech.site]: " GITLAB_HOST
 GITLAB_HOST=${GITLAB_HOST:-git.agdtech.site}
 
-# 9.2 Token (NOVO - agora pede durante instalação)
+# 9.2 Token
 echo ""
 echo -e "${C_YELLOW}${C_BOLD}Configure seu Personal Access Token${C_RESET}"
 echo -e "${C_BLUE}Obtenha em: https://${GITLAB_HOST}/-/user_settings/personal_access_tokens${C_RESET}"
@@ -257,7 +257,11 @@ if [[ -n "$GIT_EMAIL" ]]; then
     log_info "Git user.email: $GIT_EMAIL"
 fi
 
-# 13. Salvar Token
+# 13. Configurar credential helper (NÃO VAI MAIS PEDIR TOKEN!)
+git config --global credential.helper store
+log_info "Credential helper configurado (token salvo automaticamente)"
+
+# 14. Salvar Token
 if [[ "$SKIP_TOKEN" == "false" ]]; then
     # Usar mesma lógica do script gl
     if command -v secret-tool &>/dev/null; then
@@ -273,7 +277,21 @@ if [[ "$SKIP_TOKEN" == "false" ]]; then
         log_info "Token armazenado criptografado"
     fi
 
-    # 14. Testar conexão com GitLab
+    # Salvar token também em ~/.git-credentials para git push
+    CRED_FILE="$HOME/.git-credentials"
+
+    # Verificar se já existe entrada para esse host
+    if [[ -f "$CRED_FILE" ]] && grep -q "://${GITLAB_HOST}" "$CRED_FILE"; then
+        # Remover entrada antiga
+        sed -i "/${GITLAB_HOST}/d" "$CRED_FILE"
+    fi
+
+    # Adicionar nova entrada
+    echo "https://oauth2:${GITLAB_TOKEN}@${GITLAB_HOST}" >> "$CRED_FILE"
+    chmod 600 "$CRED_FILE"
+    log_info "Token salvo em ~/.git-credentials (não vai pedir senha em git push)"
+
+    # 15. Testar conexão com GitLab
     echo ""
     log_step "Testando conexão com GitLab..."
 
@@ -295,7 +313,7 @@ if [[ "$SKIP_TOKEN" == "false" ]]; then
     fi
 fi
 
-# 15. Mensagem Final
+# 16. Mensagem Final
 echo ""
 echo -e "${C_BLUE}${C_BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
 echo -e "${C_BOLD}Próximos passos:${C_RESET}"
@@ -321,4 +339,6 @@ echo -e "${C_BLUE}${C_BOLD}━━━━━━━━━━━━━━━━━�
 echo ""
 echo -e "${C_GREEN}Documentação:${C_RESET} https://github.com/seu-repo/gl"
 echo -e "${C_GREEN}Issues:${C_RESET}        https://github.com/seu-repo/gl/issues"
+echo ""
+echo -e "${C_YELLOW}${C_BOLD}✨ Token configurado! Git push não vai pedir senha! ✨${C_RESET}"
 echo ""

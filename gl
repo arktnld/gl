@@ -106,6 +106,20 @@ store_token_secure() {
         chmod 600 "$token_file"
         log_info "Token armazenado criptografado em $token_file"
     fi
+
+    # Salvar também em ~/.git-credentials para git push
+    local gitlab_host=$(get_config "gitlab_host" "git.agdtech.site")
+    local cred_file="$HOME/.git-credentials"
+
+    # Remover entrada antiga do host
+    if [[ -f "$cred_file" ]]; then
+        sed -i "/${gitlab_host}/d" "$cred_file" 2>/dev/null || true
+    fi
+
+    # Adicionar nova entrada
+    echo "https://oauth2:${token}@${gitlab_host}" >> "$cred_file"
+    chmod 600 "$cred_file"
+    log_info "Token salvo em ~/.git-credentials (git push não pedirá senha)"
 }
 
 get_token_secure() {
@@ -367,7 +381,9 @@ create_gitlab_project() {
 get_project_id_from_url() {
     local remote_url=$(git config --get remote.origin.url)
     local gitlab_host=$(get_config "gitlab_host" "git.agdtech.site")
-    local project_path=$(echo "$remote_url" | sed -E "s/git@${gitlab_host}://; s/\.git$//")
+
+    # Suportar tanto HTTPS quanto SSH
+    local project_path=$(echo "$remote_url" | sed -E "s|https://${gitlab_host}/||; s|git@${gitlab_host}:||; s|\.git$||")
     local encoded=$(jq -nr --arg s "$project_path" '$s|@uri')
 
     local response=$(gitlab_api_request "GET" "/projects/${encoded}")
@@ -434,6 +450,10 @@ EOF
     fi
 
     store_token_secure "$token"
+
+    # Configurar credential helper
+    git config --global credential.helper store
+    log_info "Credential helper configurado"
 
     # Test connection
     echo -e "\n${C_BLUE}Testando conexão...${C_RESET}"
@@ -505,6 +525,21 @@ doctor() {
     else
         echo "  ${C_RED}✗${C_RESET} Token não configurado"
         ((issues++))
+    fi
+
+    # Git credentials
+    if [[ -f "$HOME/.git-credentials" ]]; then
+        echo "  ${C_GREEN}✓${C_RESET} Git credentials configurado"
+    else
+        echo "  ${C_YELLOW}⚠${C_RESET} Git credentials não encontrado"
+    fi
+
+    # Credential helper
+    local cred_helper=$(git config --global credential.helper 2>/dev/null || echo "")
+    if [[ "$cred_helper" == "store" ]]; then
+        echo "  ${C_GREEN}✓${C_RESET} Credential helper: store"
+    else
+        echo "  ${C_YELLOW}⚠${C_RESET} Credential helper: $cred_helper (recomendado: store)"
     fi
 
     # GitLab connectivity
@@ -670,7 +705,7 @@ main_flow_new() {
 
     if [[ -n "$template" ]]; then
         local gitlab_host=$(get_config "gitlab_host" "git.agdtech.site")
-        local template_url="git@${gitlab_host}:templates/${template}.git"
+        local template_url="https://${gitlab_host}/templates/${template}.git"
 
         log_info "Clonando template: $template"
         if ! git clone "$template_url" . &>/dev/null; then
@@ -686,7 +721,7 @@ main_flow_new() {
     create_gitlab_project "$project_name" "$parent_id"
 
     local gitlab_host=$(get_config "gitlab_host" "git.agdtech.site")
-    local repo_url="git@${gitlab_host}:${group_path}/${project_name}.git"
+    local repo_url="https://${gitlab_host}/${group_path}/${project_name}.git"
 
     git init --quiet
     git checkout -b main &>/dev/null
@@ -858,7 +893,7 @@ main() {
         local parent_id=$(process_group_path "templates")
         create_gitlab_project "$create_template" "$parent_id"
 
-        local repo_url="git@${gitlab_host}:templates/${create_template}.git"
+        local repo_url="https://${gitlab_host}/templates/${create_template}.git"
         git init --quiet && git checkout -b main &>/dev/null
         git remote add origin "$repo_url"
         git add . && git commit -m "feat: template ${create_template}" --quiet
