@@ -6,7 +6,7 @@
 
 set -euo pipefail
 
-readonly REPO_URL="https://raw.githubusercontent.com/arktnld/gl/master/gl"
+readonly REPO_URL="https://raw.githubusercontent.com/seu-repo/gl/main/gl"
 readonly SCRIPT_NAME="gl"
 readonly VERSION="4.0"
 
@@ -97,15 +97,12 @@ fi
 log_step "Determinando local de instalação..."
 
 if [[ $EUID -eq 0 ]]; then
-    # Executando como root
     INSTALL_DIR="/usr/local/bin"
     log_info "Instalação global: $INSTALL_DIR (root)"
 elif [[ -w /usr/local/bin ]]; then
-    # Tem permissão em /usr/local/bin
     INSTALL_DIR="/usr/local/bin"
     log_info "Instalação global: $INSTALL_DIR"
 else
-    # Instalação local
     INSTALL_DIR="$HOME/.local/bin"
     mkdir -p "$INSTALL_DIR"
     log_info "Instalação local: $INSTALL_DIR"
@@ -141,10 +138,10 @@ else
 fi
 
 # 7. Configurar PATH (se necessário)
+NEEDS_SOURCE=false
 if [[ "$INSTALL_DIR" == "$HOME/.local/bin" ]] && [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
     log_step "Configurando PATH..."
 
-    # Detectar shell
     SHELL_RC=""
     if [[ -n "${BASH_VERSION:-}" ]]; then
         SHELL_RC="$HOME/.bashrc"
@@ -158,17 +155,12 @@ if [[ "$INSTALL_DIR" == "$HOME/.local/bin" ]] && [[ ":$PATH:" != *":$INSTALL_DIR
         SHELL_RC="$HOME/.profile"
     fi
 
-    read -p "Adicionar $INSTALL_DIR ao PATH em $SHELL_RC? (Y/n): " add_path
-    if [[ ! "$add_path" =~ ^[Nn]$ ]]; then
-        echo "" >> "$SHELL_RC"
-        echo "# gl - GitLab Tool" >> "$SHELL_RC"
-        echo "export PATH=\"\$PATH:$INSTALL_DIR\"" >> "$SHELL_RC"
-        log_info "PATH atualizado em $SHELL_RC"
-        export PATH="$PATH:$INSTALL_DIR"
-        NEEDS_SOURCE=true
-    else
-        log_warn "Adicione manualmente: export PATH=\"\$PATH:$INSTALL_DIR\""
-    fi
+    echo "" >> "$SHELL_RC"
+    echo "# gl - GitLab Tool" >> "$SHELL_RC"
+    echo "export PATH=\"\$PATH:$INSTALL_DIR\"" >> "$SHELL_RC"
+    log_info "PATH atualizado em $SHELL_RC"
+    export PATH="$PATH:$INSTALL_DIR"
+    NEEDS_SOURCE=true
 fi
 
 # 8. Testar Instalação
@@ -180,23 +172,130 @@ else
     log_warn "Reinicie seu terminal ou execute: source $SHELL_RC"
 fi
 
-# 9. Setup Inicial
+# 9. Setup Inicial COMPLETO (novo!)
 echo ""
 echo -e "${C_GREEN}${C_BOLD}✅ Instalação concluída!${C_RESET}\n"
 
-read -p "Executar configuração inicial agora? (Y/n): " run_setup
+log_step "Configuração Inicial"
+
+# 9.1 GitLab Host
+read -p "GitLab Host [git.agdtech.site]: " GITLAB_HOST
+GITLAB_HOST=${GITLAB_HOST:-git.agdtech.site}
+
+# 9.2 Token (NOVO - agora pede durante instalação)
 echo ""
-if [[ ! "$run_setup" =~ ^[Nn]$ ]]; then
-    if command -v gl &>/dev/null; then
-        gl --setup
-    else
-        "$TARGET_PATH" --setup
-    fi
+echo -e "${C_YELLOW}${C_BOLD}Configure seu Personal Access Token${C_RESET}"
+echo -e "${C_BLUE}Obtenha em: https://${GITLAB_HOST}/-/user_settings/personal_access_tokens${C_RESET}"
+echo ""
+echo "Scopes necessários:"
+echo "  • api"
+echo "  • read_user"
+echo "  • write_repository"
+echo ""
+read -sp "Token (cole aqui): " GITLAB_TOKEN
+echo ""
+
+if [[ -z "$GITLAB_TOKEN" ]]; then
+    echo ""
+    log_warn "Token não fornecido. Execute depois: gl --setup"
+    SKIP_TOKEN=true
 else
-    echo -e "${C_YELLOW}Execute depois: gl --setup${C_RESET}"
+    SKIP_TOKEN=false
 fi
 
-# 10. Mensagem Final
+# 9.3 Git User
+echo ""
+GIT_NAME=$(git config --global user.name 2>/dev/null || echo "")
+GIT_EMAIL=$(git config --global user.email 2>/dev/null || echo "")
+
+if [[ -z "$GIT_NAME" ]]; then
+    read -p "Seu nome para commits: " GIT_NAME
+fi
+
+if [[ -z "$GIT_EMAIL" ]]; then
+    read -p "Seu email para commits: " GIT_EMAIL
+fi
+
+# 9.4 Preferências
+echo ""
+read -p "Visibilidade padrão (private/internal/public) [private]: " VISIBILITY
+VISIBILITY=${VISIBILITY:-private}
+
+read -p "Fazer backup antes de force push? (Y/n): " BACKUP_PREF
+if [[ "$BACKUP_PREF" =~ ^[Nn]$ ]]; then
+    BACKUP_BEFORE_FORCE="false"
+else
+    BACKUP_BEFORE_FORCE="true"
+fi
+
+# 10. Criar estrutura de configuração
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gl"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/gl"
+mkdir -p "$CONFIG_DIR" "$DATA_DIR/backups"
+touch "$CONFIG_DIR/watched-repos.txt"
+
+# 11. Salvar configurações
+CONFIG_FILE="$CONFIG_DIR/config.json"
+cat > "$CONFIG_FILE" << EOF
+{
+  "gitlab_host": "$GITLAB_HOST",
+  "default_visibility": "$VISIBILITY",
+  "backup_before_force": "$BACKUP_BEFORE_FORCE"
+}
+EOF
+
+log_info "Configuração salva em: $CONFIG_FILE"
+
+# 12. Configurar Git global
+if [[ -n "$GIT_NAME" ]]; then
+    git config --global user.name "$GIT_NAME"
+    log_info "Git user.name: $GIT_NAME"
+fi
+
+if [[ -n "$GIT_EMAIL" ]]; then
+    git config --global user.email "$GIT_EMAIL"
+    log_info "Git user.email: $GIT_EMAIL"
+fi
+
+# 13. Salvar Token
+if [[ "$SKIP_TOKEN" == "false" ]]; then
+    # Usar mesma lógica do script gl
+    if command -v secret-tool &>/dev/null; then
+        echo -n "$GITLAB_TOKEN" | secret-tool store --label="GitLab Token (gl)" application gl service gitlab 2>/dev/null
+        log_info "Token armazenado no GNOME Keyring"
+    elif [[ -f /usr/bin/security ]]; then
+        security add-generic-password -a "$USER" -s "gl-gitlab-token" -w "$GITLAB_TOKEN" -U 2>/dev/null
+        log_info "Token armazenado no macOS Keychain"
+    else
+        TOKEN_FILE="$CONFIG_DIR/token.enc"
+        echo -n "$GITLAB_TOKEN" | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -out "$TOKEN_FILE" -pass pass:"$USER-$(hostname)" 2>/dev/null
+        chmod 600 "$TOKEN_FILE"
+        log_info "Token armazenado criptografado"
+    fi
+
+    # 14. Testar conexão com GitLab
+    echo ""
+    log_step "Testando conexão com GitLab..."
+
+    TEST_RESULT=$(curl -s -w "\n%{http_code}" \
+        --request GET "https://${GITLAB_HOST}/api/v4/user" \
+        --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" 2>/dev/null)
+
+    HTTP_CODE=$(echo "$TEST_RESULT" | tail -n1)
+    BODY=$(echo "$TEST_RESULT" | sed '$d')
+
+    if [[ "$HTTP_CODE" == "200" ]]; then
+        USERNAME=$(echo "$BODY" | jq -r '.username // "unknown"' 2>/dev/null)
+        log_info "${C_GREEN}Conectado como: ${C_BOLD}$USERNAME${C_RESET}"
+    else
+        log_error "Falha na autenticação (HTTP $HTTP_CODE)"
+        echo "Resposta: $BODY"
+        echo ""
+        log_warn "Execute 'gl --set-token' para reconfigurar"
+    fi
+fi
+
+# 15. Mensagem Final
 echo ""
 echo -e "${C_BLUE}${C_BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
 echo -e "${C_BOLD}Próximos passos:${C_RESET}"
@@ -206,9 +305,15 @@ echo -e "  ${C_GREEN}2.${C_RESET} Ver ajuda:       ${C_BOLD}gl --help${C_RESET}"
 echo -e "  ${C_GREEN}3.${C_RESET} Usar:            ${C_BOLD}cd seu-projeto && gl${C_RESET}"
 echo ""
 
-if [[ "${NEEDS_SOURCE:-false}" == "true" ]]; then
+if [[ "$NEEDS_SOURCE" == "true" ]]; then
     echo -e "${C_YELLOW}⚠  Reinicie o terminal ou execute:${C_RESET}"
     echo -e "   ${C_BOLD}source $SHELL_RC${C_RESET}"
+    echo ""
+fi
+
+if [[ "$SKIP_TOKEN" == "true" ]]; then
+    echo -e "${C_YELLOW}⚠  Token não configurado. Execute:${C_RESET}"
+    echo -e "   ${C_BOLD}gl --setup${C_RESET}"
     echo ""
 fi
 
