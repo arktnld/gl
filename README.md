@@ -1,6 +1,6 @@
 # 🚀 gl - Git/GitLab Automation Tool
 
-Uma ferramenta profissional para gerenciar repositórios Git com GitLab de forma automatizada, segura e eficiente.
+Ferramenta profissional para gerenciar repositórios Git com GitLab de forma automatizada, segura e eficiente.
 
 [![Version](https://img.shields.io/badge/version-4.0-blue.svg)](https://github.com/seu-repo/gl)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
