@@ -2,15 +2,6 @@
 
 Ferramenta profissional para gerenciar repositórios Git com GitLab de forma automatizada, segura e eficiente.
 
-```
-   _____ _
-  / ____| |
- | |  __| |
- | | |_ | |
- | |__| | |____
-  \_____|______|
-```
-
 [![Version](https://img.shields.io/badge/version-4.0-blue.svg)](https://github.com/seu-repo/gl)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Shell](https://img.shields.io/badge/shell-bash-orange.svg)](https://www.gnu.org/software/bash/)
