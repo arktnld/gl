@@ -1,0 +1,893 @@
+#!/bin/bash
+#
+# gl - Git/GitLab Automation Tool
+# Versão: 4.0
+# Autor: Cleberson & AI
+#
+# Descrição: Sistema completo de automação Git/GitLab com segurança,
+# configuração persistente, auto-commit daemon e diagnósticos.
+#
+
+set -euo pipefail
+
+# --- Constantes ---
+readonly SCRIPT_NAME="gl"
+readonly SCRIPT_VERSION="4.0"
+readonly CURRENT_DIR="$(pwd)"
+readonly CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gl"
+readonly DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/gl"
+readonly CONFIG_FILE="$CONFIG_DIR/config.json"
+readonly WATCHED_REPOS="$CONFIG_DIR/watched-repos.txt"
+readonly BACKUP_DIR="$DATA_DIR/backups"
+readonly LOG_FILE="$DATA_DIR/gl.log"
+
+# --- Cores ---
+if tput setaf 1 &>/dev/null; then
+    readonly C_RED=$(tput setaf 1)
+    readonly C_GREEN=$(tput setaf 2)
+    readonly C_YELLOW=$(tput setaf 3)
+    readonly C_BLUE=$(tput setaf 4)
+    readonly C_MAGENTA=$(tput setaf 5)
+    readonly C_CYAN=$(tput setaf 6)
+    readonly C_BOLD=$(tput bold)
+    readonly C_RESET=$(tput sgr0)
+else
+    readonly C_RED="" C_GREEN="" C_YELLOW="" C_BLUE="" C_MAGENTA="" C_CYAN="" C_BOLD="" C_RESET=""
+fi
+
+LOG_LEVEL=2
+
+# --- Funções de Log ---
+log_message() {
+    local level=$1 message=$2 level_name color
+    case $level in
+        0) level_name="ERROR"; color="$C_RED" ;;
+        1) level_name="WARN "; color="$C_YELLOW" ;;
+        2) level_name="INFO "; color="$C_GREEN" ;;
+        3) level_name="DEBUG"; color="$C_BLUE" ;;
+        *) level_name="UNKWN"; color="" ;;
+    esac
+
+    if [[ $LOG_LEVEL -ge $level ]]; then
+        echo -e "$(date '+%H:%M:%S') ${color}${C_BOLD}[${level_name}]${C_RESET} ${message}" >&2
+    fi
+
+    [[ -f "$LOG_FILE" ]] && echo "$(date '+%Y-%m-%d %H:%M:%S') [${level_name}] ${message}" >> "$LOG_FILE"
+}
+
+log_error() { log_message 0 "$*"; }
+log_warn()  { log_message 1 "$*"; }
+log_info()  { log_message 2 "$*"; }
+log_debug() { log_message 3 "$*"; }
+
+# --- Configuração ---
+ensure_dirs() {
+    mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$BACKUP_DIR"
+    touch "$WATCHED_REPOS" "$LOG_FILE"
+}
+
+get_config() {
+    local key="$1"
+    local default="${2:-}"
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "$default"
+        return
+    fi
+
+    jq -r ".${key} // \"${default}\"" "$CONFIG_FILE" 2>/dev/null || echo "$default"
+}
+
+set_config() {
+    local key="$1" value="$2"
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo '{}' > "$CONFIG_FILE"
+    fi
+
+    local tmp=$(mktemp)
+    jq --arg k "$key" --arg v "$value" '.[$k] = $v' "$CONFIG_FILE" > "$tmp"
+    mv "$tmp" "$CONFIG_FILE"
+}
+
+# --- Segurança - Token ---
+store_token_secure() {
+    local token="$1"
+
+    if command -v secret-tool &>/dev/null; then
+        echo -n "$token" | secret-tool store --label="GitLab Token (gl)" application gl service gitlab 2>/dev/null
+        log_info "Token armazenado no GNOME Keyring"
+    elif [[ -f /usr/bin/security ]]; then
+        security add-generic-password -a "$USER" -s "gl-gitlab-token" -w "$token" -U 2>/dev/null
+        log_info "Token armazenado no macOS Keychain"
+    else
+        local token_file="$CONFIG_DIR/token.enc"
+        echo -n "$token" | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -out "$token_file" -pass pass:"$USER-$(hostname)" 2>/dev/null
+        chmod 600 "$token_file"
+        log_info "Token armazenado criptografado em $token_file"
+    fi
+}
+
+get_token_secure() {
+    if command -v secret-tool &>/dev/null; then
+        secret-tool lookup application gl service gitlab 2>/dev/null
+    elif [[ -f /usr/bin/security ]]; then
+        security find-generic-password -a "$USER" -s "gl-gitlab-token" -w 2>/dev/null
+    else
+        local token_file="$CONFIG_DIR/token.enc"
+        if [[ -f "$token_file" ]]; then
+            openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 -in "$token_file" -pass pass:"$USER-$(hostname)" 2>/dev/null
+        fi
+    fi
+}
+
+# --- Validação ---
+validate_project_name() {
+    local name="$1"
+
+    if [[ ! "$name" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+        log_error "Nome inválido: use apenas a-z, A-Z, 0-9, _, -, ."
+        return 1
+    fi
+
+    if [[ ${#name} -lt 3 || ${#name} -gt 100 ]]; then
+        log_error "Nome deve ter entre 3-100 caracteres"
+        return 1
+    fi
+
+    local reserved=("admin" "api" "help" "explore" "groups" "projects" "users")
+    for word in "${reserved[@]}"; do
+        if [[ "$name" == "$word" ]]; then
+            log_error "'$name' é palavra reservada"
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+sanitize_commit_message() {
+    local msg="$1"
+    msg=$(echo "$msg" | tr -d '\000-\037\177')
+    msg="${msg:0:500}"
+
+    if [[ ! "$msg" =~ ^(feat|fix|docs|style|refactor|test|chore|perf)(\(.+\))?: ]]; then
+        msg="chore: $msg"
+    fi
+
+    echo "$msg"
+}
+
+# --- API GitLab ---
+gitlab_api_request() {
+    local method="$1" endpoint="$2" data="${3:-}"
+    local max_retries=3 retry_delay=2
+    local gitlab_host=$(get_config "gitlab_host" "git.agdtech.site")
+    local api_url="https://${gitlab_host}/api/v4"
+    local token=$(get_token_secure)
+
+    if [[ -z "$token" ]]; then
+        log_error "Token não configurado. Execute: gl --setup"
+        return 1
+    fi
+
+    for attempt in $(seq 1 $max_retries); do
+        local response http_code
+
+        response=$(curl -s -w "\n%{http_code}" \
+            --request "$method" "${api_url}${endpoint}" \
+            --header "PRIVATE-TOKEN: ${token}" \
+            --header "Content-Type: application/json" \
+            --data "$data" 2>/dev/null)
+
+        http_code=$(echo "$response" | tail -n1)
+        local body=$(echo "$response" | sed '$d')
+
+        log_debug "API ${method} ${endpoint} -> ${http_code}"
+
+        case $http_code in
+            200|201) echo "$body"; return 0 ;;
+            400|405|406) log_error "Erro ${http_code}: $(echo "$body" | jq -r '.message // .error // "Unknown"' 2>/dev/null || echo "Unknown")"; return 1 ;;
+            401) log_error "Token inválido ou expirado"; return 1 ;;
+            404) log_debug "Recurso não encontrado (404)"; return 0 ;;
+            409) log_warn "Recurso já existe (409)"; echo "$body"; return 0 ;;
+            429)
+                log_warn "Rate limit atingido. Aguardando..."
+                sleep $((retry_delay * 2))
+                continue
+                ;;
+            500|502|503|504)
+                if [[ $attempt -lt $max_retries ]]; then
+                    log_warn "Erro ${http_code}. Tentativa ${attempt}/${max_retries}..."
+                    sleep $retry_delay
+                    retry_delay=$((retry_delay * 2))
+                    continue
+                fi
+                ;;
+            *) log_error "Erro inesperado ${http_code}"; return 1 ;;
+        esac
+    done
+
+    return 1
+}
+
+# --- Spinner ---
+spinner() {
+    local pid=$1 message="${2:-Processando...}"
+    local spin=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+
+    tput civis 2>/dev/null || true
+    while ps -p "$pid" &>/dev/null; do
+        for i in "${spin[@]}"; do
+            ! ps -p "$pid" &>/dev/null && break
+            printf "\r ${C_BLUE}${i}${C_RESET} %s" "$message"
+            sleep 0.1
+        done
+    done
+    printf "\r\033[K"
+    tput cnorm 2>/dev/null || true
+}
+
+run_with_spinner() {
+    local cmd="$1" message="${2:-Executando...}"
+    eval "$cmd" &>/dev/null &
+    local pid=$!
+    spinner "$pid" "$message"
+    wait "$pid"
+}
+
+# --- Git Operations ---
+backup_before_force_push() {
+    local timestamp=$(date '+%Y%m%d_%H%M%S')
+    local repo_name=$(basename "$(git rev-parse --show-toplevel 2>/dev/null || echo 'repo')")
+    local backup_path="$BACKUP_DIR/${repo_name}_${timestamp}.bundle"
+
+    git bundle create "$backup_path" --all &>/dev/null
+    log_info "Backup criado: ${backup_path}"
+
+    # Limpa backups antigos (mantém 10)
+    ls -t "$BACKUP_DIR"/*.bundle 2>/dev/null | tail -n +11 | xargs -r rm 2>/dev/null || true
+}
+
+check_remote_sync() {
+    log_info "Verificando sincronia com remoto..."
+
+    if ! git fetch origin &>/dev/null; then
+        log_warn "Sem conexão com remoto"
+        return 0
+    fi
+
+    local local_branch=$(git rev-parse --abbrev-ref HEAD)
+    local remote_branch=$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null || echo "")
+
+    if [[ -z "$remote_branch" ]]; then
+        log_warn "Branch sem upstream configurado"
+        return 0
+    fi
+
+    local LOCAL=$(git rev-parse @)
+    local REMOTE=$(git rev-parse @{u})
+    local BASE=$(git merge-base @ @{u})
+
+    if [[ "$LOCAL" == "$REMOTE" ]]; then
+        log_info "Branch sincronizado"
+    elif [[ "$LOCAL" == "$BASE" ]]; then
+        log_error "Branch desatualizado! Execute: git pull"
+        exit 1
+    elif [[ "$REMOTE" == "$BASE" ]]; then
+        log_info "Branch à frente do remoto"
+    else
+        log_error "Histórico divergente! Execute: git pull --rebase"
+        exit 1
+    fi
+}
+
+push_to_gitlab() {
+    local target_branch="$1" force="${2:-false}"
+    local current_branch=$(git rev-parse --abbrev-ref HEAD)
+
+    local push_cmd="git push -u origin ${current_branch}:${target_branch}"
+
+    if [[ "$force" == "true" ]]; then
+        if [[ "$(get_config 'backup_before_force' 'true')" == "true" ]]; then
+            backup_before_force_push
+        fi
+        push_cmd="git push -u --force-with-lease origin ${current_branch}:${target_branch}"
+        log_warn "Push forçado com backup!"
+    fi
+
+    if ! run_with_spinner "$push_cmd" "Enviando para GitLab..."; then
+        log_error "Falha no push"
+        exit 1
+    fi
+
+    log_info "${C_GREEN}Push realizado com sucesso!${C_RESET}"
+}
+
+# --- GitLab Resources ---
+get_group_id() {
+    local group_path="$1"
+    local encoded=$(jq -nr --arg s "$group_path" '$s|@uri')
+    local response=$(gitlab_api_request "GET" "/groups/${encoded}")
+    echo "$response" | jq -r '.id // ""'
+}
+
+create_gitlab_group() {
+    local name="$1" parent_id="${2:-}"
+    local visibility=$(get_config "default_visibility" "private")
+
+    local data=$(jq -n --arg n "$name" --arg p "$name" --arg v "$visibility" \
+        '{name: $n, path: $p, visibility: $v}')
+
+    if [[ -n "$parent_id" ]]; then
+        data=$(echo "$data" | jq --argjson pid "$parent_id" '. + {parent_id: $pid}')
+    fi
+
+    local response=$(gitlab_api_request "POST" "/groups" "$data")
+    echo "$response" | jq -r '.id // ""'
+}
+
+process_group_path() {
+    local full_path="$1"
+    local parent_id="" current_path=""
+
+    for segment in ${full_path//\// }; do
+        current_path="${current_path:+$current_path/}$segment"
+
+        local group_id=$(get_group_id "$current_path")
+
+        if [[ -z "$group_id" ]]; then
+            log_info "Criando grupo: ${segment}"
+            group_id=$(create_gitlab_group "$segment" "$parent_id")
+        fi
+
+        parent_id="$group_id"
+    done
+
+    echo "$parent_id"
+}
+
+create_gitlab_project() {
+    local name="$1" namespace_id="$2"
+    local visibility=$(get_config "default_visibility" "private")
+
+    validate_project_name "$name" || exit 1
+
+    local data=$(jq -n \
+        --arg n "$name" \
+        --arg p "$name" \
+        --argjson ns "$namespace_id" \
+        --arg v "$visibility" \
+        '{name: $n, path: $p, namespace_id: $ns, visibility: $v}')
+
+    gitlab_api_request "POST" "/projects" "$data" &>/dev/null
+    log_info "Projeto '${name}' criado/confirmado"
+}
+
+get_project_id_from_url() {
+    local remote_url=$(git config --get remote.origin.url)
+    local gitlab_host=$(get_config "gitlab_host" "git.agdtech.site")
+    local project_path=$(echo "$remote_url" | sed -E "s/git@${gitlab_host}://; s/\.git$//")
+    local encoded=$(jq -nr --arg s "$project_path" '$s|@uri')
+
+    local response=$(gitlab_api_request "GET" "/projects/${encoded}")
+    echo "$response" | jq -r '.id // ""'
+}
+
+create_merge_request() {
+    local source="$1" target="$2"
+    local project_id=$(get_project_id_from_url)
+
+    if [[ -z "$project_id" ]]; then
+        log_error "Não foi possível obter ID do projeto"
+        return 1
+    fi
+
+    local title=$(git log -1 --pretty=%s)
+    local data=$(jq -n \
+        --arg sb "$source" \
+        --arg tb "$target" \
+        --arg t "$title" \
+        '{source_branch: $sb, target_branch: $tb, title: $t}')
+
+    local response=$(gitlab_api_request "POST" "/projects/${project_id}/merge_requests" "$data")
+    local mr_url=$(echo "$response" | jq -r '.web_url // ""')
+
+    if [[ -n "$mr_url" ]]; then
+        log_info "${C_GREEN}MR criado: ${C_BOLD}${mr_url}${C_RESET}"
+    else
+        log_error "Falha ao criar MR"
+    fi
+}
+
+# --- Setup Wizard ---
+setup_wizard() {
+    echo -e "${C_BOLD}${C_CYAN}"
+    cat << "EOF"
+   _____ _
+  / ____| |
+ | |  __| |
+ | | |_ | |
+ | |__| | |____
+  \_____|______|
+
+  Setup Wizard v4.0
+EOF
+    echo -e "${C_RESET}"
+
+    # GitLab Host
+    local current_host=$(get_config "gitlab_host" "git.agdtech.site")
+    read -p "GitLab Host [${current_host}]: " host
+    host=${host:-$current_host}
+    set_config "gitlab_host" "$host"
+
+    # Token
+    echo -e "\n${C_YELLOW}Configure seu Personal Access Token${C_RESET}"
+    echo "Obtenha em: https://${host}/-/user_settings/personal_access_tokens"
+    echo "Scopes necessários: api, read_user, write_repository"
+    read -sp "Token: " token
+    echo
+
+    if [[ -z "$token" ]]; then
+        log_error "Token obrigatório"
+        exit 1
+    fi
+
+    store_token_secure "$token"
+
+    # Test connection
+    echo -e "\n${C_BLUE}Testando conexão...${C_RESET}"
+    local user_info=$(gitlab_api_request "GET" "/user")
+    local username=$(echo "$user_info" | jq -r '.username // ""')
+
+    if [[ -n "$username" ]]; then
+        log_info "${C_GREEN}✓ Conectado como: ${username}${C_RESET}"
+    else
+        log_error "Falha na autenticação"
+        exit 1
+    fi
+
+    # Git config
+    local git_name=$(git config --global user.name 2>/dev/null || echo "")
+    local git_email=$(git config --global user.email 2>/dev/null || echo "")
+
+    if [[ -z "$git_name" ]]; then
+        read -p "Seu nome para commits: " git_name
+        git config --global user.name "$git_name"
+    fi
+
+    if [[ -z "$git_email" ]]; then
+        read -p "Seu email para commits: " git_email
+        git config --global user.email "$git_email"
+    fi
+
+    # Preferências
+    echo -e "\n${C_YELLOW}Preferências${C_RESET}"
+
+    read -p "Visibilidade padrão (private/internal/public) [private]: " visibility
+    set_config "default_visibility" "${visibility:-private}"
+
+    read -p "Fazer backup antes de force push? (Y/n): " backup_pref
+    [[ "$backup_pref" =~ ^[Nn]$ ]] && set_config "backup_before_force" "false" || set_config "backup_before_force" "true"
+
+    echo -e "\n${C_GREEN}${C_BOLD}✓ Setup concluído!${C_RESET}"
+    echo -e "Configuração salva em: ${CONFIG_FILE}"
+}
+
+# --- Doctor (Diagnóstico) ---
+doctor() {
+    echo -e "${C_BOLD}${C_CYAN}=== gl Health Check ===${C_RESET}\n"
+
+    local issues=0
+
+    # Dependencies
+    echo -e "${C_BOLD}Dependências:${C_RESET}"
+    for cmd in git curl jq openssl; do
+        if command -v "$cmd" &>/dev/null; then
+            echo "  ${C_GREEN}✓${C_RESET} $cmd"
+        else
+            echo "  ${C_RED}✗${C_RESET} $cmd ${C_RED}(FALTANDO)${C_RESET}"
+            ((issues++))
+        fi
+    done
+
+    # Config
+    echo -e "\n${C_BOLD}Configuração:${C_RESET}"
+    if [[ -f "$CONFIG_FILE" ]]; then
+        echo "  ${C_GREEN}✓${C_RESET} Arquivo de config"
+    else
+        echo "  ${C_YELLOW}⚠${C_RESET} Config não encontrada (execute: gl --setup)"
+    fi
+
+    # Token
+    if [[ -n "$(get_token_secure)" ]]; then
+        echo "  ${C_GREEN}✓${C_RESET} Token armazenado"
+    else
+        echo "  ${C_RED}✗${C_RESET} Token não configurado"
+        ((issues++))
+    fi
+
+    # GitLab connectivity
+    echo -e "\n${C_BOLD}Conectividade:${C_RESET}"
+    local gitlab_host=$(get_config "gitlab_host" "git.agdtech.site")
+
+    if curl -sf -o /dev/null --head "https://${gitlab_host}" 2>/dev/null; then
+        echo "  ${C_GREEN}✓${C_RESET} GitLab acessível (${gitlab_host})"
+    else
+        echo "  ${C_RED}✗${C_RESET} GitLab inacessível"
+        ((issues++))
+    fi
+
+    # API test
+    if gitlab_api_request "GET" "/user" &>/dev/null; then
+        local user=$(gitlab_api_request "GET" "/user" | jq -r '.username')
+        echo "  ${C_GREEN}✓${C_RESET} API funcional (user: ${user})"
+    else
+        echo "  ${C_RED}✗${C_RESET} Falha na API"
+        ((issues++))
+    fi
+
+    # Git config
+    echo -e "\n${C_BOLD}Git:${C_RESET}"
+    if [[ -n "$(git config --global user.name)" ]]; then
+        echo "  ${C_GREEN}✓${C_RESET} user.name: $(git config --global user.name)"
+    else
+        echo "  ${C_YELLOW}⚠${C_RESET} user.name não configurado"
+    fi
+
+    if [[ -n "$(git config --global user.email)" ]]; then
+        echo "  ${C_GREEN}✓${C_RESET} user.email: $(git config --global user.email)"
+    else
+        echo "  ${C_YELLOW}⚠${C_RESET} user.email não configurado"
+    fi
+
+    # Summary
+    echo -e "\n${C_BOLD}Resumo:${C_RESET}"
+    if [[ $issues -eq 0 ]]; then
+        echo "  ${C_GREEN}✓ Tudo OK!${C_RESET}"
+    else
+        echo "  ${C_RED}✗ ${issues} problema(s) encontrado(s)${C_RESET}"
+    fi
+
+    return $issues
+}
+
+# --- Daemon Mode ---
+daemon_mode() {
+    log_info "Iniciando daemon mode..."
+
+    if [[ ! -f "$WATCHED_REPOS" || ! -s "$WATCHED_REPOS" ]]; then
+        log_error "Nenhum repositório monitorado. Use: gl --add-watch <PATH>"
+        exit 1
+    fi
+
+    local processed=0 errors=0
+
+    while IFS= read -r repo_path; do
+        [[ -z "$repo_path" || "$repo_path" =~ ^# ]] && continue
+
+        if [[ ! -d "$repo_path/.git" ]]; then
+            log_warn "Ignorando: $repo_path (não é repo Git)"
+            continue
+        fi
+
+        cd "$repo_path" || continue
+
+        if [[ -z "$(git status --porcelain)" ]]; then
+            log_debug "Sem alterações: $repo_path"
+            continue
+        fi
+
+        local changed=$(git status --porcelain | wc -l)
+        local repo_name=$(basename "$repo_path")
+        local msg="chore: auto-commit (${changed} files) [$(date '+%Y-%m-%d %H:%M')]"
+
+        log_info "Processando: $repo_name ($changed alterações)"
+
+        git add . &>/dev/null
+        git commit -m "$msg" &>/dev/null
+
+        if push_to_gitlab "$(git rev-parse --abbrev-ref HEAD)" "false"; then
+            ((processed++))
+            log_info "✓ $repo_name"
+        else
+            ((errors++))
+            log_error "✗ $repo_name"
+        fi
+    done < "$WATCHED_REPOS"
+
+    log_info "Daemon concluído: ${processed} repos processados, ${errors} erros"
+}
+
+add_watch() {
+    local path="$1"
+
+    if [[ ! -d "$path/.git" ]]; then
+        log_error "'$path' não é um repositório Git"
+        exit 1
+    fi
+
+    path=$(realpath "$path")
+
+    if grep -Fxq "$path" "$WATCHED_REPOS" 2>/dev/null; then
+        log_warn "Repositório já monitorado"
+        exit 0
+    fi
+
+    echo "$path" >> "$WATCHED_REPOS"
+    log_info "Repositório adicionado ao monitoramento: $path"
+}
+
+list_watched() {
+    if [[ ! -f "$WATCHED_REPOS" || ! -s "$WATCHED_REPOS" ]]; then
+        echo "Nenhum repositório monitorado"
+        return
+    fi
+
+    echo -e "${C_BOLD}Repositórios Monitorados:${C_RESET}"
+    while IFS= read -r repo; do
+        [[ -z "$repo" || "$repo" =~ ^# ]] && continue
+        echo "  • $repo"
+    done < "$WATCHED_REPOS"
+}
+
+# --- Main Flows ---
+main_flow_existing() {
+    local target_branch="$1" force="$2" mr_target="$3"
+
+    log_info "Modo: Repositório Existente"
+
+    check_remote_sync
+
+    if [[ -n "$(git status --porcelain)" ]]; then
+        log_info "Alterações detectadas:"
+        git status --short | while read -r line; do
+            echo "  ${C_YELLOW}$line${C_RESET}"
+        done
+
+        read -p "Mensagem do commit (ou Enter para pular): " msg
+
+        if [[ -n "$msg" ]]; then
+            msg=$(sanitize_commit_message "$msg")
+            git add . && git commit -m "$msg" --quiet
+            log_info "Commit: $msg"
+        fi
+    else
+        log_info "Sem alterações para commitar"
+    fi
+
+    push_to_gitlab "$target_branch" "$force"
+
+    if [[ -n "$mr_target" ]]; then
+        create_merge_request "$target_branch" "$mr_target"
+    fi
+}
+
+main_flow_new() {
+    local group_path="$1" project_name="$2" template="$3"
+
+    log_info "Modo: Novo Projeto"
+
+    if [[ -n "$template" ]]; then
+        local gitlab_host=$(get_config "gitlab_host" "git.agdtech.site")
+        local template_url="git@${gitlab_host}:templates/${template}.git"
+
+        log_info "Clonando template: $template"
+        if ! git clone "$template_url" . &>/dev/null; then
+            log_error "Template não encontrado: $template"
+            exit 1
+        fi
+        rm -rf .git
+    fi
+
+    validate_project_name "$project_name" || exit 1
+
+    local parent_id=$(process_group_path "$group_path")
+    create_gitlab_project "$project_name" "$parent_id"
+
+    local gitlab_host=$(get_config "gitlab_host" "git.agdtech.site")
+    local repo_url="git@${gitlab_host}:${group_path}/${project_name}.git"
+
+    git init --quiet
+    git checkout -b main &>/dev/null
+    git remote add origin "$repo_url"
+
+    if [[ ! -f ".gitignore" ]]; then
+        cat > .gitignore << 'EOF'
+# Python
+__pycache__/
+*.py[cod]
+.Python
+env/
+venv/
+.venv/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs & Databases
+*.log
+*.db
+*.sqlite3
+
+# Environment
+.env
+.env.local
+EOF
+    fi
+
+    git add .
+
+    if [[ -n "$(git status --porcelain)" ]]; then
+        read -p "Mensagem do commit inicial [feat: initial project setup]: " msg
+        msg=${msg:-"feat: initial project setup"}
+        msg=$(sanitize_commit_message "$msg")
+        git commit -m "$msg" --quiet
+    fi
+
+    push_to_gitlab "main" "false"
+
+    echo -e "\n${C_GREEN}${C_BOLD}✓ Projeto criado!${C_RESET}"
+    echo -e "${C_CYAN}URL: https://$(get_config 'gitlab_host')/${group_path}/${project_name}${C_RESET}"
+}
+
+# --- Usage ---
+usage() {
+    cat << EOF
+${C_BOLD}gl v${SCRIPT_VERSION}${C_RESET} - Git/GitLab Automation Tool
+
+${C_BOLD}USO:${C_RESET}
+  gl [OPTIONS] [GROUP_PATH] [PROJECT_NAME]
+
+${C_BOLD}SETUP:${C_RESET}
+  --setup              Configuração inicial interativa
+  --doctor             Diagnóstico de problemas
+  --set-token          Atualizar token
+  --version            Mostrar versão
+
+${C_BOLD}GIT:${C_RESET}
+  -m, --mr             Criar MR para main
+  -M <BRANCH>          Criar MR para branch específico
+  -f, --force-push     Push forçado (com backup)
+  -b <BRANCH>          Branch de destino
+
+${C_BOLD}DAEMON:${C_RESET}
+  --daemon             Processar repos monitorados (usar em cron)
+  --add-watch <PATH>   Adicionar repo ao monitoramento
+  --list-watch         Listar repos monitorados
+
+${C_BOLD}TEMPLATES:${C_RESET}
+  -c <NOME>            Criar template
+  -t <NOME>            Usar template
+
+${C_BOLD}OUTROS:${C_RESET}
+  -v, --verbose        Modo verbose (debug)
+  -h, --help           Mostrar esta ajuda
+
+${C_BOLD}EXEMPLOS:${C_RESET}
+  ${C_GREEN}# Setup inicial${C_RESET}
+  gl --setup
+
+  ${C_GREEN}# Novo projeto${C_RESET}
+  gl atendflow/backend meu-projeto
+
+  ${C_GREEN}# Commit & Push${C_RESET}
+  gl -m
+
+  ${C_GREEN}# Push para branch específico + MR${C_RESET}
+  gl -b develop -M main
+
+  ${C_GREEN}# Auto-commit diário (crontab)${C_RESET}
+  0 18 * * * gl --daemon
+
+${C_BOLD}DOCUMENTAÇÃO:${C_RESET}
+  https://github.com/seu-repo/gl
+
+EOF
+}
+
+# --- Main ---
+main() {
+    ensure_dirs
+
+    # Handler para --version
+    if [[ "${1:-}" == "--version" ]]; then
+        echo "gl version ${SCRIPT_VERSION}"
+        exit 0
+    fi
+
+    local group_path="" project_name="" template="" target_branch="" force="false"
+    local mr_target="" create_template=""
+
+    local opts
+    opts=$(getopt -o c:t:fb:mM:vh --long setup,doctor,set-token,daemon,add-watch:,list-watch,create-template:,template-repo:,force-push,branch:,mr,mr-target:,verbose,version,help -n "$SCRIPT_NAME" -- "$@")
+    if [[ $? != 0 ]]; then usage; exit 1; fi
+    eval set -- "$opts"
+
+    while true; do
+        case "$1" in
+            --setup) setup_wizard; exit 0 ;;
+            --doctor) doctor; exit $? ;;
+            --version) echo "gl version ${SCRIPT_VERSION}"; exit 0 ;;
+            --set-token)
+                read -sp "Novo token: " token; echo
+                store_token_secure "$token"
+                log_info "Token atualizado"
+                exit 0 ;;
+            --daemon) daemon_mode; exit 0 ;;
+            --add-watch) add_watch "$2"; exit 0 ;;
+            --list-watch) list_watched; exit 0 ;;
+            -c|--create-template) create_template="$2"; shift 2 ;;
+            -t|--template-repo) template="$2"; shift 2 ;;
+            -f|--force-push) force="true"; shift ;;
+            -b|--branch) target_branch="$2"; shift 2 ;;
+            -m|--mr) mr_target="main"; shift ;;
+            -M|--mr-target) mr_target="$2"; shift 2 ;;
+            -v|--verbose) LOG_LEVEL=3; shift ;;
+            -h|--help) usage; exit 0 ;;
+            --) shift; break ;;
+            *) log_error "Erro de parsing"; exit 1 ;;
+        esac
+    done
+
+    group_path="${1:-}"
+    project_name="${2:-$(basename "$CURRENT_DIR")}"
+
+    # Verificar setup
+    if [[ ! -f "$CONFIG_FILE" || -z "$(get_token_secure)" ]]; then
+        log_error "Execute primeiro: gl --setup"
+        exit 1
+    fi
+
+    # Create template
+    if [[ -n "$create_template" ]]; then
+        if [[ -d ".git" ]]; then
+            read -p "Remover .git atual? (y/N): " confirm
+            [[ ! "$confirm" =~ ^[Yy]$ ]] && exit 1
+            rm -rf .git
+        fi
+
+        local gitlab_host=$(get_config "gitlab_host")
+        local parent_id=$(process_group_path "templates")
+        create_gitlab_project "$create_template" "$parent_id"
+
+        local repo_url="git@${gitlab_host}:templates/${create_template}.git"
+        git init --quiet && git checkout -b main &>/dev/null
+        git remote add origin "$repo_url"
+        git add . && git commit -m "feat: template ${create_template}" --quiet
+        push_to_gitlab "main" "false"
+        exit 0
+    fi
+
+    # Existing vs New
+    if [[ -d ".git" ]]; then
+        if [[ -n "$group_path" ]]; then
+            log_error "Já é um repo Git. Não forneça GROUP_PATH."
+            exit 1
+        fi
+
+        [[ -z "$target_branch" ]] && target_branch=$(git rev-parse --abbrev-ref HEAD)
+        main_flow_existing "$target_branch" "$force" "$mr_target"
+    else
+        if [[ -z "$group_path" ]]; then
+            log_error "Forneça GROUP_PATH para criar novo projeto"
+            usage; exit 1
+        fi
+
+        if [[ -n "$mr_target" ]]; then
+            log_error "--mr só funciona em repos existentes"
+            exit 1
+        fi
+
+        main_flow_new "$group_path" "$project_name" "$template"
+    fi
+}
+
+main "$@"
