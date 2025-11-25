@@ -1,6 +1,6 @@
 # 🚀 gl - Git/GitLab Automation Tool
 
-Ferramenta profissional para gerenciar repositórios Git com GitLab de forma automatizada, segura e eficiente.
+Uma ferramenta profissional para gerenciar repositórios Git com GitLab de forma automatizada, segura e eficiente.
 
 [![Version](https://img.shields.io/badge/version-4.0-blue.svg)](https://github.com/seu-repo/gl)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -12,7 +12,7 @@ Ferramenta profissional para gerenciar repositórios Git com GitLab de forma aut
 
 ```bash
 # 1. Instalar
-curl -fsSL https://raw.githubusercontent.com/seu-repo/gl/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/arktnld/gl/main/install.sh | bash
 
 # 2. Configurar
 gl --setup
@@ -42,7 +42,7 @@ gl
 ### Método 1: Instalador Automático (Recomendado)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/seu-repo/gl/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/arktnld/gl/main/install.sh | bash
 ```
 
 O instalador irá:
@@ -55,12 +55,12 @@ O instalador irá:
 
 ```bash
 # Download
-sudo curl -o /usr/local/bin/gl https://raw.githubusercontent.com/seu-repo/gl/main/gl
+sudo curl -o /usr/local/bin/gl https://raw.githubusercontent.com/arktnld/gl/main/gl
 sudo chmod +x /usr/local/bin/gl
 
 # Ou instalação local
 mkdir -p ~/.local/bin
-curl -o ~/.local/bin/gl https://raw.githubusercontent.com/seu-repo/gl/main/gl
+curl -o ~/.local/bin/gl https://raw.githubusercontent.com/arktnld/gl/main/gl
 chmod +x ~/.local/bin/gl
 export PATH="$PATH:$HOME/.local/bin"
 ```
